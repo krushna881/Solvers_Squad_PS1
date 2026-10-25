@@ -77,6 +77,10 @@ def _retry(fn, *, attempts: int, delay: float):
             return fn()
         except (httpx.HTTPError, httpx.ConnectError) as exc:
             last_err = exc
+            # Do not retry on non-recoverable 4xx client errors (except 429)
+            if isinstance(exc, httpx.HTTPStatusError) and 400 <= exc.response.status_code < 500 and exc.response.status_code != 429:
+                logger.error("Ollama client error %d: %s", exc.response.status_code, exc.response.text)
+                raise
             if i < attempts - 1:
                 wait = delay * (2 ** i)
                 logger.warning("Ollama call failed (%s); retry %d in %.1fs", exc, i + 1, wait)
@@ -219,6 +223,49 @@ def chat_with_tools(
     def _call():
         with _make_client() as client:
             r = client.post("/api/chat", json=payload)
+            if r.status_code == 400 and "does not support tools" in r.text:
+                logger.info(
+                    "Model '%s' does not support native tools in Ollama; falling back to prompt-guided execution",
+                    _model,
+                )
+                payload_fallback = dict(payload)
+                payload_fallback.pop("tools", None)
+                if tools:
+                    tool_descs = []
+                    for t in tools:
+                        fn = t.get("function", {})
+                        tool_descs.append(f"- {fn.get('name')}: {fn.get('description', '')}")
+                    tool_guide = (
+                        "\n\nAvailable tools:\n"
+                        + "\n".join(tool_descs)
+                        + '\n\nIf you need to call a tool, reply ONLY with JSON: {"name": "<tool_name>", "arguments": {<args>}}'
+                        + '\nIMPORTANT: If you have already received the tool result, or have enough information, do NOT call any more tools — give your final direct response to the user in plain text.'
+                    )
+                    raw_msgs = payload_fallback.get("messages", [])
+                    cleaned_msgs = []
+                    for m in raw_msgs:
+                        if m.get("role") == "tool":
+                            t_name = m.get("tool_name", "tool")
+                            cleaned_msgs.append({
+                                "role": "user",
+                                "content": f"[Tool Result for '{t_name}']:\n{m.get('content', '')}\n\nBased on this tool result, please answer the user request now in plain text.",
+                            })
+                        else:
+                            cleaned_msgs.append(dict(m))
+
+                    if cleaned_msgs and cleaned_msgs[0].get("role") == "system":
+                        cleaned_msgs[0] = {
+                            "role": "system",
+                            "content": cleaned_msgs[0].get("content", "") + tool_guide,
+                        }
+                    else:
+                        cleaned_msgs.insert(0, {"role": "system", "content": tool_guide.strip()})
+                    payload_fallback["messages"] = cleaned_msgs
+
+                r_fallback = client.post("/api/chat", json=payload_fallback)
+                r_fallback.raise_for_status()
+                return r_fallback.json()
+
             r.raise_for_status()
             return r.json()
 
@@ -241,6 +288,33 @@ def chat_with_tools(
             except json.JSONDecodeError:
                 args_raw = {}
         parsed_calls.append(ToolCall(name=name, arguments=args_raw))
+
+    # If native tool_calls is empty, inspect final_content for text-formatted JSON tool calls
+    if not parsed_calls and final_content:
+        import re
+        candidates = []
+        # 1. Extract markdown code blocks
+        code_blocks = re.findall(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', final_content, re.DOTALL)
+        candidates.extend(code_blocks)
+        # 2. Extract balanced or general json-like objects
+        raw_blocks = re.findall(r'(\{(?:[^{}]|(?:\{[^{}]*\}))*\})', final_content, re.DOTALL)
+        candidates.extend(raw_blocks)
+        for cand in candidates:
+            try:
+                obj = json.loads(cand)
+                if isinstance(obj, dict) and "name" in obj:
+                    t_name = str(obj["name"]).strip()
+                    t_args = obj.get("arguments", {})
+                    if isinstance(t_args, str):
+                        try:
+                            t_args = json.loads(t_args)
+                        except Exception:
+                            t_args = {}
+                    parsed_calls.append(ToolCall(name=t_name, arguments=t_args if isinstance(t_args, dict) else {}))
+                    final_content = None
+                    break
+            except Exception:
+                continue
 
     result = ChatToolResult(
         tool_calls=parsed_calls,
