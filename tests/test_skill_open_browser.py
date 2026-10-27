@@ -109,3 +109,136 @@ def test_ui_voice_endpoints():
         )
         assert res.status_code == 200
         assert res.json()["status"] == "success"
+
+
+@pytest.mark.parametrize(
+    "run_num, prompt, expected_url_part",
+    [
+        (1, "open yt", "https://www.youtube.com"),
+        (2, "open yt and search neural network architecture", "youtube.com/results?search_query=neural+network+architecture"),
+        (3, "play bohemian rhapsody on yt", "youtube.com/results?search_query=bohemian+rhapsody"),
+    ],
+)
+def test_yt_aliases_and_url_fallback_opens_browser_3x(run_num, prompt, expected_url_part):
+    """
+    Test End-to-End 3x:
+    Validates that 'yt' commands and YouTube search voice commands ALWAYS open YouTube in the browser.
+    """
+    with patch("webbrowser.open") as mock_open:
+        agent = AgentLoop()
+        res = agent.chat(prompt)
+        assert res.steps_taken >= 1
+        assert "open_browser" in res.tool_calls_made
+        mock_open.assert_called_once()
+        called_url = mock_open.call_args[0][0]
+        assert expected_url_part in called_url
+
+
+def test_agent_auto_opens_browser_when_llm_gives_url():
+    """
+    Test that if the LLM finishes without tool calls but includes a YouTube URL in answer,
+    AgentLoop detects the URL and triggers open_browser anyway so the user doesn't just get a URL.
+    """
+    fake_answer = "Sure, you can watch it here: https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    fake_llm_result = MagicMock()
+    fake_llm_result.has_tool_calls = False
+    fake_llm_result.final_content = fake_answer
+
+    with patch("ragnarok.llm.chat_with_tools", return_value=fake_llm_result), \
+         patch("webbrowser.open") as mock_open:
+        agent = AgentLoop()
+        res = agent.chat("can you find me that video?")
+        assert "open_browser" in res.tool_calls_made
+        mock_open.assert_called_once_with("https://www.youtube.com/watch?v=dQw4w9WgXcQ", new=2)
+
+
+@pytest.mark.parametrize(
+    "run_num, prompt, expected_url_part",
+    [
+        (1, "search on google generative artificial intelligence", "google.com/search?q=generative+artificial+intelligence"),
+        (2, "search google for quantum supremacy breakthroughs", "google.com/search?q=quantum+supremacy+breakthroughs"),
+        (3, "google best python backend frameworks", "google.com/search?q=best+python+backend+frameworks"),
+    ],
+)
+def test_google_search_flow_end_to_end_3x(run_num, prompt, expected_url_part):
+    """Test Google search commands 3x with different input queries."""
+    with patch("webbrowser.open") as mock_open:
+        agent = AgentLoop()
+        res = agent.chat(prompt)
+        assert "open_browser" in res.tool_calls_made
+        mock_open.assert_called_once()
+        assert expected_url_part in mock_open.call_args[0][0]
+
+
+@pytest.mark.parametrize(
+    "run_num, prompt, expected_url_part",
+    [
+        (1, "open gamil", "mail.google.com"),
+        (2, "search mail for quarterly invoice report", "mail.google.com/mail/u/0/#search/quarterly+invoice+report"),
+        (3, "search on gmail for airline flight reservation", "mail.google.com/mail/u/0/#search/airline+flight+reservation"),
+    ],
+)
+def test_gmail_and_gamil_flow_end_to_end_3x(run_num, prompt, expected_url_part):
+    """Test Gmail & Gamil opening and search queries 3x."""
+    with patch("webbrowser.open") as mock_open:
+        agent = AgentLoop()
+        res = agent.chat(prompt)
+        assert "open_browser" in res.tool_calls_made
+        mock_open.assert_called_once()
+        assert expected_url_part in mock_open.call_args[0][0]
+
+
+@pytest.mark.parametrize(
+    "run_num, prompt, expected_url_part",
+    [
+        (1, "directions to Central Park New York", "google.com/maps/search/Central+Park+New+York"),
+        (2, "search maps for Italian restaurants nearby", "google.com/maps/search/Italian+restaurants+nearby"),
+        (3, "open maps", "maps.google.com"),
+    ],
+)
+def test_maps_flow_end_to_end_3x(run_num, prompt, expected_url_part):
+    """Test Google Maps navigation and location search 3x."""
+    with patch("webbrowser.open") as mock_open:
+        agent = AgentLoop()
+        res = agent.chat(prompt)
+        assert "open_browser" in res.tool_calls_made
+        mock_open.assert_called_once()
+        assert expected_url_part in mock_open.call_args[0][0]
+
+
+@pytest.mark.parametrize(
+    "run_num, prompt, expected_url_part",
+    [
+        (1, "search github for fastapi template", "github.com/search?q=fastapi+template"),
+        (2, "search wikipedia for Alan Turing computer science", "wikipedia.org/wiki/Special:Search?search=Alan+Turing+computer+science"),
+        (3, "search spotify for lofi beats study session", "open.spotify.com/search/lofi+beats+study+session"),
+    ],
+)
+def test_extended_apps_flow_end_to_end_3x(run_num, prompt, expected_url_part):
+    """Test GitHub, Wikipedia, and Spotify searches 3x."""
+    with patch("webbrowser.open") as mock_open:
+        agent = AgentLoop()
+        res = agent.chat(prompt)
+        assert "open_browser" in res.tool_calls_made
+        mock_open.assert_called_once()
+        assert expected_url_part in mock_open.call_args[0][0]
+
+
+@pytest.mark.parametrize(
+    "run_num, prompt, expected_app",
+    [
+        (1, "open calculator", "calculator"),
+        (2, "open notepad", "notepad"),
+        (3, "launch file explorer", "explorer"),
+    ],
+)
+def test_desktop_applications_launch_3x(run_num, prompt, expected_app):
+    """Test local desktop application launcher 3x with different apps."""
+    with patch("subprocess.Popen") as mock_popen:
+        agent = AgentLoop()
+        res = agent.chat(prompt)
+        assert "open_browser" in res.tool_calls_made
+        assert "application on your desktop" in res.answer.lower()
+        mock_popen.assert_called_once()
+
+

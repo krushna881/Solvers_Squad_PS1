@@ -834,19 +834,84 @@
     const modelNameEl = document.getElementById('cli-model-name');
     const hwStatEl = document.getElementById('cli-hw-stat');
 
-    // Retrieve Ragnarok Security Token
-    function getToken() {
-      const urlParams = new URLSearchParams(window.location.search);
-      const qToken = urlParams.get('token');
-      if (qToken) return qToken;
+    // Retrieve Ragnarok Security Token dynamically
+    let currentToken = '';
+
+    async function resolveActiveToken() {
+      // 1. Meta tag injected by backend
       const meta = document.querySelector('meta[name="ragnarok-token"]');
       if (meta && meta.content && !meta.content.startsWith('{{')) {
-        return meta.content;
+        currentToken = meta.content;
+        return currentToken;
+      }
+      // 2. Query param
+      const urlParams = new URLSearchParams(window.location.search);
+      const qToken = urlParams.get('token');
+      if (qToken) {
+        currentToken = qToken;
+        return currentToken;
+      }
+      // 3. LocalStorage
+      const stored = localStorage.getItem('ragnarok_token');
+      if (stored) {
+        currentToken = stored;
+        return currentToken;
+      }
+      // 4. Local origin endpoint fallback
+      try {
+        const res = await fetch('/api/security/token');
+        if (res.ok) {
+          const d = await res.json();
+          if (d.token) {
+            currentToken = d.token;
+            localStorage.setItem('ragnarok_token', currentToken);
+            if (meta) meta.content = currentToken;
+            return currentToken;
+          }
+        }
+      } catch(e) {}
+      return '';
+    }
+
+    function getToken() {
+      if (currentToken) return currentToken;
+      const meta = document.querySelector('meta[name="ragnarok-token"]');
+      if (meta && meta.content && !meta.content.startsWith('{{')) {
+        currentToken = meta.content;
+        return currentToken;
+      }
+      const urlParams = new URLSearchParams(window.location.search);
+      const qToken = urlParams.get('token');
+      if (qToken) {
+        currentToken = qToken;
+        return currentToken;
+      }
+      const stored = localStorage.getItem('ragnarok_token');
+      if (stored) {
+        currentToken = stored;
+        return stored;
       }
       return '';
     }
 
-    const token = getToken();
+    // Connect WebSocket to stay synchronized with rotated tokens in real-time
+    (function initTokenWs() {
+      try {
+        const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${proto}//${window.location.host}/ws/token`);
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'token_rotated' && data.token) {
+              currentToken = data.token;
+              localStorage.setItem('ragnarok_token', data.token);
+              const meta = document.querySelector('meta[name="ragnarok-token"]');
+              if (meta) meta.content = data.token;
+            }
+          } catch(e) {}
+        };
+      } catch(e) {}
+    })();
 
     // Command History
     const history = [];
@@ -894,7 +959,7 @@
       appendCliOutput(`<div class="text-primary-container text-[11px]">&gt; Querying local system telemetry...</div>`);
       try {
         const res = await fetch('/api/status', {
-          headers: { 'X-Ragnarok-Token': token }
+          headers: { 'X-Ragnarok-Token': getToken() }
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
         const data = await res.json();
@@ -936,7 +1001,7 @@
       appendCliOutput(`<div class="text-primary-container text-[11px]">&gt; Loading persistent memory store...</div>`);
       try {
         const res = await fetch('/api/memory', {
-          headers: { 'X-Ragnarok-Token': token }
+          headers: { 'X-Ragnarok-Token': getToken() }
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const items = await res.json();
@@ -969,7 +1034,7 @@
       appendCliOutput(`<div class="text-primary-container text-[11px]">&gt; Checking pending tool approvals...</div>`);
       try {
         const res = await fetch('/api/approvals', {
-          headers: { 'X-Ragnarok-Token': token }
+          headers: { 'X-Ragnarok-Token': getToken() }
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const items = await res.json();
@@ -1006,7 +1071,7 @@
       try {
         const res = await fetch(`/api/approvals/${reqId}`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'X-Ragnarok-Token': token },
+          headers: { 'Content-Type': 'application/json', 'X-Ragnarok-Token': getToken() },
           body: JSON.stringify({ status: status, comment: `Responded via CLI terminal: ${status}` })
         });
         if (res.ok) {
@@ -1031,6 +1096,8 @@
       escaped = escaped.replace(/`([^`]+)`/g, '<code class="px-1 py-0.5 rounded bg-surface-container border border-outline-variant/20 text-primary-container text-[11px] font-mono">$1</code>');
       // Bold
       escaped = escaped.replace(/\*\*([^*]+)\*\*/g, '<strong class="text-primary font-semibold">$1</strong>');
+      // Clickable Links
+      escaped = escaped.replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer" class="text-primary-container underline hover:text-primary font-semibold">$1</a>');
       // Line breaks
       return escaped.replace(/\n/g, '<br/>');
     }
@@ -1088,7 +1155,7 @@
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Ragnarok-Token': token
+          'X-Ragnarok-Token': getToken()
         },
         body: JSON.stringify({ text: clean.slice(0, 400) })
       }).catch(() => {});
@@ -1168,7 +1235,7 @@
       try {
         const res = await fetch('/api/voice/listen?duration_sec=4.0', {
           method: 'POST',
-          headers: { 'X-Ragnarok-Token': token }
+          headers: { 'X-Ragnarok-Token': getToken() }
         });
         const d = await res.json();
         isVoiceListening = false;
@@ -1299,14 +1366,40 @@
       `);
 
       try {
-        const response = await fetch('/api/chat', {
+        let activeTok = await resolveActiveToken();
+        let response = await fetch('/api/chat', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'X-Ragnarok-Token': token
+            'X-Ragnarok-Token': activeTok
           },
           body: JSON.stringify({ message: cleanCmd })
         });
+
+        // Auto-recover from token desynchronization
+        if (response.status === 401) {
+          try {
+            const tokRes = await fetch('/api/security/token');
+            if (tokRes.ok) {
+              const tokData = await tokRes.json();
+              if (tokData.token) {
+                currentToken = tokData.token;
+                activeTok = currentToken;
+                localStorage.setItem('ragnarok_token', currentToken);
+                const meta = document.querySelector('meta[name="ragnarok-token"]');
+                if (meta) meta.content = currentToken;
+                response = await fetch('/api/chat', {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'X-Ragnarok-Token': activeTok
+                  },
+                  body: JSON.stringify({ message: cleanCmd })
+                });
+              }
+            }
+          } catch(e) {}
+        }
 
         // Remove loading indicator
         const loadEl = document.getElementById(loadingId);
@@ -1331,10 +1424,90 @@
           `);
         }
 
+        // Detect if a browser, search, or web application URL was navigated or provided
+        const urlMatch = data.answer ? data.answer.match(/https?:\/\/[^\s"'<>]+/) : null;
+        let launchBtnHtml = '';
+        if (urlMatch) {
+          const targetUrl = urlMatch[0].replace(/[.,;:)]+$/, '');
+          let btnLabel = '🌐 Open Link';
+          let btnIcon = 'open_in_new';
+
+          if (targetUrl.includes('youtube.com') || targetUrl.includes('youtu.be')) {
+            btnLabel = '▶ Open in YouTube';
+            btnIcon = 'play_circle';
+          } else if (targetUrl.includes('mail.google.com')) {
+            btnLabel = '✉ Open in Gmail';
+            btnIcon = 'mail';
+          } else if (targetUrl.includes('google.com/maps') || targetUrl.includes('maps.google.com')) {
+            btnLabel = '🗺 Open in Google Maps';
+            btnIcon = 'map';
+          } else if (targetUrl.includes('google.com/search')) {
+            btnLabel = '🔍 View on Google';
+            btnIcon = 'search';
+          } else if (targetUrl.includes('drive.google.com')) {
+            btnLabel = '📁 Open in Google Drive';
+            btnIcon = 'folder';
+          } else if (targetUrl.includes('docs.google.com')) {
+            btnLabel = '📄 Open in Google Docs';
+            btnIcon = 'description';
+          } else if (targetUrl.includes('sheets.google.com')) {
+            btnLabel = '📊 Open in Google Sheets';
+            btnIcon = 'table_chart';
+          } else if (targetUrl.includes('calendar.google.com')) {
+            btnLabel = '📅 Open in Calendar';
+            btnIcon = 'calendar_month';
+          } else if (targetUrl.includes('github.com')) {
+            btnLabel = '💻 Open in GitHub';
+            btnIcon = 'code';
+          } else if (targetUrl.includes('wikipedia.org')) {
+            btnLabel = '📚 Open in Wikipedia';
+            btnIcon = 'menu_book';
+          } else if (targetUrl.includes('spotify.com')) {
+            btnLabel = '🎵 Open in Spotify';
+            btnIcon = 'music_note';
+          } else if (targetUrl.includes('reddit.com')) {
+            btnLabel = '💬 Open in Reddit';
+            btnIcon = 'forum';
+          } else if (targetUrl.includes('chatgpt.com')) {
+            btnLabel = '🤖 Open in ChatGPT';
+            btnIcon = 'smart_toy';
+          } else if (targetUrl.includes('claude.ai')) {
+            btnLabel = '🧠 Open in Claude';
+            btnIcon = 'psychology';
+          } else if (targetUrl.includes('web.whatsapp.com')) {
+            btnLabel = '💬 Open WhatsApp';
+            btnIcon = 'chat';
+          } else if (targetUrl.includes('linkedin.com')) {
+            btnLabel = '💼 Open LinkedIn';
+            btnIcon = 'work';
+          } else if (targetUrl.includes('notion.so')) {
+            btnLabel = '📝 Open Notion';
+            btnIcon = 'edit_note';
+          }
+
+          launchBtnHtml = `
+            <div class="pt-2">
+              <a href="${targetUrl}" target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-primary-container/20 hover:bg-primary-container/30 text-primary-container border border-primary-container/40 text-[11px] font-bold shadow-[0_0_12px_rgba(51,204,255,0.25)] transition-all">
+                <span>${btnLabel}</span>
+                <span class="material-symbols-outlined text-[13px]">${btnIcon}</span>
+              </a>
+            </div>
+          `;
+          // If browser popup allowed, open tab directly in web UI
+          if (data.tool_calls && data.tool_calls.includes('open_browser')) {
+            try {
+              window.open(targetUrl, '_blank');
+            } catch(e) {
+              console.debug('Direct window.open blocked by browser:', e);
+            }
+          }
+        }
+
         // Render AI Answer
         appendCliOutput(`
           <div class="p-3 rounded-2xl bg-surface-container-low/70 border border-outline-variant/20 text-[11.5px] text-on-surface leading-relaxed shadow-sm font-mono">
             ${formatResponse(data.answer)}
+            ${launchBtnHtml}
           </div>
         `);
 
